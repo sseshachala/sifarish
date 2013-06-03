@@ -33,13 +33,17 @@ import org.apache.hadoop.mapreduce.lib.input.FileSplit;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
+import org.chombo.util.SecondarySort;
 import org.chombo.util.TextPair;
 import org.chombo.util.Tuple;
 import org.chombo.util.Utility;
 import org.omg.CORBA.portable.ValueOutputStream;
+import org.sifarish.common.UtilityPredictor.ItemIdGroupComprator;
+import org.sifarish.common.UtilityPredictor.ItemIdPartitioner;
 
 /**
- * Injects business goal into rated items and figures out final net rating
+ * Injects business goal into rated items and figures out final net rating. The basic idea is to 
+ * find a middle ground between consumer interest and business interest
  * @author pranab
  *
  */
@@ -64,6 +68,9 @@ public class BusinessGoalInjector extends Configured implements Tool{
         job.setOutputKeyClass(NullWritable.class);
         job.setOutputValueClass(Text.class);
  
+        job.setGroupingComparatorClass(SecondarySort.TuplePairGroupComprator.class);
+        job.setPartitionerClass(SecondarySort.TuplePairPartitioner.class);
+
         Utility.setConfiguration(job.getConfiguration());
         job.setNumReduceTasks(job.getConfiguration().getInt("num.reducer", 1));
         int status =  job.waitForCompletion(true) ? 0 : 1;
@@ -85,7 +92,7 @@ public class BusinessGoalInjector extends Configured implements Tool{
          */
         protected void setup(Context context) throws IOException, InterruptedException {
         	fieldDelim = context.getConfiguration().get("field.delim", ",");
-        	String bizGoalFilePrefix = context.getConfiguration().get("bizGoal.file.prefix", "biz");
+        	String bizGoalFilePrefix = context.getConfiguration().get("biz.goal.file.prefix", "biz");
         	isBizGoalFileSplit = ((FileSplit)context.getInputSplit()).getPath().getName().startsWith(bizGoalFilePrefix);
         }    
     	
@@ -111,8 +118,9 @@ public class BusinessGoalInjector extends Configured implements Tool{
            		keyOut.add(items[1], 1);
            		
            		//userID, score
-           		keyOut.add(items[0], Integer.parseInt(items[2]));
+           		valOut.add(items[0], Integer.parseInt(items[2]));
            	}
+           	context.write(keyOut, valOut);
         }    
     }
     
@@ -124,6 +132,7 @@ public class BusinessGoalInjector extends Configured implements Tool{
     	private String fieldDelim;
     	private Text valOut = new Text();
     	private int[] bizGoalWeights;
+    	private int[] bizGoalThreshold;
         private int recWt;
         private int maxBizGoalWeight;
         private  final int  MAX_WEIGHT = 100;
@@ -135,7 +144,7 @@ public class BusinessGoalInjector extends Configured implements Tool{
         	Configuration config = context.getConfiguration();
         	fieldDelim = config.get("field.delim", ",");
         	bizGoalWeights = Utility.intArrayFromString(config.get("biz.goal.weights"),fieldDelim );
-        	maxBizGoalWeight = Integer.parseInt("max.biz.goal.weight",  70);
+        	maxBizGoalWeight = config.getInt("max.biz.goal.weight",  70);
         	int sumWt = 0;
         	for (int wt : bizGoalWeights) {
         		sumWt += wt;
@@ -144,6 +153,9 @@ public class BusinessGoalInjector extends Configured implements Tool{
         		throw new IllegalArgumentException("Sum of business score weights exceed limit");
         	}
         	recWt = MAX_WEIGHT - sumWt;
+        	
+        	bizGoalThreshold = Utility.intArrayFromString(config.get("biz.goal.min.threshold"),fieldDelim );
+
         }
         
         /* (non-Javadoc)
@@ -153,7 +165,9 @@ public class BusinessGoalInjector extends Configured implements Tool{
         throws IOException, InterruptedException {
         	boolean first = true;
         	Tuple bizScore = null;
+        	boolean toSkip = false;
         	for(Tuple value : values) {
+        		toSkip = false;
         		if (first) {
         			if (value.isInt(0)) {
         				//business score available for this item
@@ -169,17 +183,24 @@ public class BusinessGoalInjector extends Configured implements Tool{
         			if (null != bizScore) {
         				//weighted average score
         				int sumWeightedScore = recWt * value.getInt(1);
-        				int numBizGoal = value.getSize();
+        				int numBizGoal = bizScore.getSize();
         				for (int i = 0; i < numBizGoal; ++i) {
-        					sumWeightedScore += bizGoalWeights[i] * value.getInt(i);
+        					int score = bizScore.getInt(i);
+        					if (bizGoalThreshold[i] >= 0 && score  <= bizGoalThreshold[i] ) {
+        						toSkip = true;
+        						break;
+        					}
+        					sumWeightedScore += bizGoalWeights[i] * score;
         				}
         				weightedScore = sumWeightedScore / MAX_WEIGHT;
         			} else {
         				//just  score
         				weightedScore = value.getInt(1);
         			}
-    				valOut.set(value.getString(0) + fieldDelim + key.getString(0) + fieldDelim + weightedScore);
-        	   		context.write(NullWritable.get(), valOut);
+        			if (!toSkip) {
+        				valOut.set(value.getString(0) + fieldDelim + key.getString(0) + fieldDelim + weightedScore);
+        				context.write(NullWritable.get(), valOut);
+        			}
         		}
         	}
         }        

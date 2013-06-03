@@ -88,9 +88,11 @@ public class UtilityPredictor extends Configured implements Tool{
     	private TextInt keyOut = new TextInt();
     	private Tuple valOut = new Tuple();
     	private String[] ratings;
+    	private Integer two = 2;
     	private Integer one = 1;
     	private Integer zero = 0;
     	private boolean linearCorrelation;
+    	private boolean isRatingStatFileSplit;
     	
         /* (non-Javadoc)
          * @see org.apache.hadoop.mapreduce.Mapper#setup(org.apache.hadoop.mapreduce.Mapper.Context)
@@ -100,6 +102,9 @@ public class UtilityPredictor extends Configured implements Tool{
         	subFieldDelim = context.getConfiguration().get("sub.field.delim", ":");
         	String ratingFilePrefix = context.getConfiguration().get("rating.file.prefix", "rating");
         	isRatingFileSplit = ((FileSplit)context.getInputSplit()).getPath().getName().startsWith(ratingFilePrefix);
+        	String ratingStatFilePrefix = context.getConfiguration().get("rating.stat.file.prefix", "stat");
+        	isRatingStatFileSplit = ((FileSplit)context.getInputSplit()).getPath().getName().startsWith(ratingStatFilePrefix);
+        	
         	linearCorrelation = context.getConfiguration().getBoolean("correlation.linear", true);
         	System.out.println("isRatingFileSplit:" + isRatingFileSplit);
         }    
@@ -111,38 +116,47 @@ public class UtilityPredictor extends Configured implements Tool{
         protected void map(LongWritable key, Text value, Context context)
             throws IOException, InterruptedException {
         	String[] items = value.toString().split(fieldDelim);
+    		String itemID = items[0];
         	if (isRatingFileSplit) {
         		//user rating
-        		String itemID = items[0];
                	for (int i = 1; i < items.length; ++i) {
                		valOut.initialize();
             		ratings = items[i].split(subFieldDelim);
             		
             		//itemID
-            		keyOut.set(itemID, 1);
+            		keyOut.set(itemID, two);
             		
             		//userID, rating
-            		valOut.add(ratings[0],  new Integer(ratings[1]), one);
+            		valOut.add(ratings[0],  new Integer(ratings[1]), two);
        	   			context.write(keyOut, valOut);
                	}
+        	} else  if (isRatingStatFileSplit) {
+        		//rating stat
+        		int ratingStdDev = Integer.parseInt(items[2]);
+        		keyOut.set(itemID, one);
+           		valOut.initialize();
+        		valOut.add(ratingStdDev,   one);
+   	   			context.write(keyOut, valOut);
         	} else {
-        		//itemsID
-        		keyOut.set(items[0], 0);
+        		//correlation
+        		keyOut.set(items[0], zero);
         		valOut.initialize();
    	   			if (linearCorrelation) {
-   	   				//itemID, correlation, intersection length (weight)
+   	   				//other itemID, correlation, intersection length (weight)
    	   				valOut.add(items[1], new Integer( items[2]), new Integer(items[3]), zero);
    	   			} else {
-   	   				//itemID, correlation, intersection length (weight)
+   	   				//other itemID, correlation, intersection length (weight)
    	   				valOut.add(items[1], new Integer("-" + items[2]), new Integer(items[3]), zero);
    	   			}
    	   			context.write(keyOut, valOut);
 
-   	   			keyOut.set(items[1], 0);
+   	   			keyOut.set(items[1], zero);
         		valOut.initialize();
    	   			if (linearCorrelation) {
+   	   				//other itemID, correlation, intersection length (weight)
    	   				valOut.add(items[0], new Integer( items[2]), new Integer(items[3]), zero);
    	   			} else {
+   	   				//other itemID, correlation, intersection length (weight)
    	   				valOut.add(items[0], new Integer("-" + items[2]), new Integer(items[3]), zero);
    	   			}
    	   			context.write(keyOut, valOut);
@@ -168,6 +182,8 @@ public class UtilityPredictor extends Configured implements Tool{
     	private int weight;
     	private long logCounter = 0;
     	private double correlationModifier;
+    	private Tuple ratingStat;
+    	private int ratingStdDev;
     	
         /* (non-Javadoc)
          * @see org.apache.hadoop.mapreduce.Reducer#setup(org.apache.hadoop.mapreduce.Reducer.Context)
@@ -176,7 +192,7 @@ public class UtilityPredictor extends Configured implements Tool{
         	fieldDelim = context.getConfiguration().get("field.delim", ",");
         	linearCorrelation = context.getConfiguration().getBoolean("correlation.linear", true);
         	correlationScale = context.getConfiguration().getInt("correlation.linear.scale", 1000);
-           	maxRating = context.getConfiguration().getInt("max.rating", 5);
+           	maxRating = context.getConfiguration().getInt("max.rating", 100);
            	correlationModifier = context.getConfiguration().getFloat("correlation.modifier", (float)1.0);
         } 	
         
@@ -187,11 +203,15 @@ public class UtilityPredictor extends Configured implements Tool{
         throws IOException, InterruptedException {
         	ratingCorrelations.clear();
         	++logCounter;
+        	ratingStat = null;
            	for(Tuple value : values) {
            		if ( ((Integer)value.get(value.getSize()-1)) == 0) {
            			//in rating correlation
            			ratingCorrelations.add(value.createClone());
 					context.getCounter("Predictor", "Rating correlation").increment(1);
+           		} else if  ( ((Integer)value.get(value.getSize()-1)) == 1 )  {
+           			//rating stat
+           			ratingStat = value.createClone();
            		} else {
            			//in user rating
            			if (!ratingCorrelations.isEmpty()) {
@@ -209,7 +229,10 @@ public class UtilityPredictor extends Configured implements Tool{
 	           				int predRating = linearCorrelation? (rating * ratingCorr) / maxRating : 
 	           					(rating  * correlationScale + ratingCorr) /maxRating ;
 	           				if (predRating > 0) {
-	           					valueOut.set(userID + fieldDelim + itemID + fieldDelim + predRating + fieldDelim + weight + fieldDelim +ratingCorr );
+	           					//userID, itemID, predicted rating, correlation length, correlation coeff, input rating std dev
+	           					ratingStdDev = ratingStat != null ? ratingStat.getInt(0) :  -1;
+	           					valueOut.set(userID + fieldDelim + itemID + fieldDelim + predRating + fieldDelim + weight + 
+	           							fieldDelim +ratingCorr  + fieldDelim + ratingStdDev);
 	           					context.write(NullWritable.get(), valueOut);
 	        					context.getCounter("Predictor", "Rating correlation").increment(1);
 	           				}
